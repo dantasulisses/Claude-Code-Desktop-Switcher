@@ -3,7 +3,7 @@ $source = Join-Path (Split-Path $PSScriptRoot -Parent) 'ClaudeSwitcher.ps1'
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($source, [ref]$null, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-foreach ($name in @('Get-Setting','Test-SignInRoutingOn','Test-SafeLink','Test-SignInLink','Get-ProfileDataPath','Test-ProfileSignedIn',
+foreach ($name in @('Get-Setting','Get-PackageCachePath','Test-SignInRoutingOn','Test-SafeLink','Test-SignInLink','Get-ProfileDataPath','Test-ProfileSignedIn',
                     'Set-PendingSignIn','Get-PendingSignIn','Clear-PendingSignIn','Select-SignInTarget','Get-LauncherScript',
                     'Get-RouterCommand','Get-RegistryDefault','Set-RegistryValue','Get-RouterRegistryPath','Test-RouterRegistered',
                     'Register-SignInRouter','Test-RouterChosen','Unregister-SignInRouter','Set-Setting','Write-RouterLog',

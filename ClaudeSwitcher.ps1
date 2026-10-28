@@ -200,6 +200,27 @@ function New-InstallInfo {
     The install path contains the version number and therefore changes each time the
     app updates itself, so a found path is only ever trusted while it still exists.
 #>
+# Where the Store build keeps the original account's data. Older builds keep it inside the
+# package (the container redirects %APPDATA%\Claude there); newer ones (seen on 4.29) moved
+# it to %LOCALAPPDATA%\Claude-Data\<family> and left a .user-data-left.<family> marker in
+# the old folder. The new folder only counts once it holds a config.json, so an empty one
+# does not hide a profile that has not moved yet.
+function Get-MsixDataPath {
+    param([Parameter(Mandatory)][string]$Family)
+    $moved = Join-Path $env:LOCALAPPDATA "Claude-Data\$Family"
+    if (Test-Path -LiteralPath (Join-Path $moved 'config.json')) { return $moved }
+    return (Join-Path $env:LOCALAPPDATA "Packages\$Family\LocalCache\Roaming\Claude")
+}
+
+# The package's LocalCache, where the container redirects writes under %LOCALAPPDATA%.
+function Get-PackageCachePath {
+    if ($script:ClaudeApp.AppUserModelId -match '^([^!]+)!') {
+        return (Join-Path $env:LOCALAPPDATA "Packages\$($Matches[1])\LocalCache")
+    }
+    # No family on record: the data folder is the old ...\LocalCache\Roaming\Claude.
+    return (Split-Path (Split-Path $script:ClaudeApp.DefaultProfilePath -Parent) -Parent)
+}
+
 function Find-ClaudeInstall {
     # Store build.
     $pkg = Get-AppxPackage -Name 'Claude' -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -211,7 +232,7 @@ function Find-ClaudeInstall {
         }
         if ($exe -and (Test-Path -LiteralPath $exe)) {
             return New-InstallInfo 'Msix' $exe ([string]$pkg.Version) "$($pkg.PackageFamilyName)!Claude" `
-                (Join-Path $env:LOCALAPPDATA "Packages\$($pkg.PackageFamilyName)\LocalCache\Roaming\Claude")
+                (Get-MsixDataPath -Family $pkg.PackageFamilyName)
         }
     }
 
@@ -272,7 +293,10 @@ function Resolve-ClaudeInstall {
     if ($AllowCache) {
         $cached = Get-Setting 'InstallCache'
         if ($cached -and $cached.Exe -and (Test-Path -LiteralPath $cached.Exe -PathType Leaf)) {
-            return New-InstallInfo $cached.Kind $cached.Exe $cached.Version $cached.AppUserModelId $cached.DefaultProfilePath
+            # The data folder can move when the app updates, so it is looked up again.
+            $data = $cached.DefaultProfilePath
+            if ($cached.Kind -eq 'Msix' -and $cached.AppUserModelId -match '^([^!]+)!') { $data = Get-MsixDataPath -Family $Matches[1] }
+            return New-InstallInfo $cached.Kind $cached.Exe $cached.Version $cached.AppUserModelId $data
         }
     }
 
@@ -1622,7 +1646,7 @@ function Get-CodeSessionRoot {
     $localPrefix = $env:LOCALAPPDATA.TrimEnd('\') + '\'
     if ($script:ClaudeApp.Kind -eq 'Msix' -and
         $TargetProfile.Path.StartsWith($localPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-        $cache = Split-Path (Split-Path $script:ClaudeApp.DefaultProfilePath -Parent) -Parent
+        $cache = Get-PackageCachePath
         $relative = $TargetProfile.Path.Substring($localPrefix.Length)
         $redirected = Join-Path (Join-Path (Join-Path $cache 'Local') $relative) 'claude-code-sessions'
         if (Test-Path -LiteralPath $redirected -PathType Container) { return $redirected }
@@ -1725,7 +1749,7 @@ function Move-LegacyProfileFolder {
         # under the same relative path (see Get-CodeSessionRoot). That part moves along.
         # Left behind, those files (Code sessions among them) no longer show in the profile.
         if ($script:ClaudeApp.Kind -eq 'Msix') {
-            $cache = Join-Path (Split-Path (Split-Path $script:ClaudeApp.DefaultProfilePath -Parent) -Parent) 'Local'
+            $cache = Join-Path (Get-PackageCachePath) 'Local'
             $from  = Join-Path $cache "ClaudeProfiles\$($d.Name)"
             $to    = Join-Path $cache ($script:ProfileDirPrefix + $d.Name)
             if (Test-Path -LiteralPath $from) {
@@ -1828,7 +1852,7 @@ function Get-ProfileDataPath {
     $localPrefix = $env:LOCALAPPDATA.TrimEnd('\') + '\'
     if ($script:ClaudeApp.Kind -eq 'Msix' -and -not $Target.IsDefault -and
         $Target.Path.StartsWith($localPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-        $cache = Split-Path (Split-Path $script:ClaudeApp.DefaultProfilePath -Parent) -Parent
+        $cache = Get-PackageCachePath
         $redirected = Join-Path (Join-Path $cache 'Local') $Target.Path.Substring($localPrefix.Length)
         if (Test-Path -LiteralPath (Join-Path $redirected 'config.json')) { return $redirected }
     }
