@@ -339,6 +339,16 @@ generated shortcuts already handle this.
 Anything fatal is shown in a message box and written to
 `%LOCALAPPDATA%\ClaudeProfiles\switcher-error.log`. If you deleted or renamed a profile
 outside the switcher, its old shortcut will report that the profile no longer exists.
+
+If the shortcut does nothing at all and there is no error, check where you ran `-Install`
+or `-RouteSignIns`. Run from a terminal that Claude itself started (the Claude desktop
+app's Code tab, or an agent running in it), Windows treats the Store app's processes
+specially: what they write under `%LOCALAPPDATA%` and in `HKCU` lands in the app's private
+copy, not the real one. The installed script then exists only there, so a shortcut clicked
+in Explorer cannot find it, and Windows never offers **Claude Profile Router** in Default
+apps. Run both from a normal PowerShell window (Start menu), not from inside Claude. To
+check, `Test-Path "$env:LOCALAPPDATA\ClaudeProfiles\.switcher\ClaudeSwitcher.ps1"` there
+should be `True`.
 </details>
 
 <details>

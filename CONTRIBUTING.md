@@ -72,7 +72,11 @@ real chats. The sign-in routing tests write only under a throwaway
 your real `claude://` handler.
 
 Then actually run the thing. Most other behavior still needs manual checks because it
-touches real processes, real windows and real profile directories. At minimum, check that:
+touches real processes, real windows and real profile directories. Do these from a normal
+PowerShell window, not from a terminal or agent started inside the Claude desktop app: on
+the Store build those processes get a private copy of `%LOCALAPPDATA%` and `HKCU`, so
+`-Install` and `-RouteSignIns` would succeed there and still change nothing Explorer or
+Windows Settings can see (see "A shortcut does nothing" in the README). At minimum, check that:
 
 - The window opens and lists your profiles with correct running state, including while
   Claude Code sessions are open (they run a `claude.exe` of their own).
