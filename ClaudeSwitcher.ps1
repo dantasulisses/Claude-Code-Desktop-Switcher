@@ -95,7 +95,10 @@ param(
     [string]$HandleLink,
     [string]$OpenLink,
     [string]$Account,
-    [string]$OpenLinksIn
+    [string]$OpenLinksIn,
+    [string]$VsCode,
+    [string]$VsCodeSync,
+    [string]$CodeLogin
 )
 
 $ErrorActionPreference = 'Stop'
@@ -483,7 +486,8 @@ function Get-NextAccountName {
 function Add-ClaudeAccount {
     $created = New-ClaudeProfile -Name (Get-NextAccountName)
     # Straight to the sign-in screen: there is nothing else to do with an empty profile.
-    Start-ClaudeProfile -Id $created.Id | Out-Null
+    # Not VS Code's account: nobody has signed in to it yet.
+    Start-ClaudeProfile -Id $created.Id -NoCodeSync | Out-Null
     return $created
 }
 
@@ -552,8 +556,328 @@ function Get-LaunchArgLine {
     return ($parts -join ' ')
 }
 
-# Returns 'focused' when the profile was already open, 'started' otherwise.
+# ------------------------------------------------------------------ VS Code --
+
+# The Claude extension for VS Code keeps its login in the Claude Code config folder (~/.claude,
+# or the folder CLAUDE_CONFIG_DIR names) and reads CLAUDE_CONFIG_DIR from its own
+# claudeCode.environmentVariables setting, following a change without a reload. Switching its
+# account is one entry in VS Code's user settings.json. That file allows comments and trailing
+# commas, which ConvertFrom-Json refuses and ConvertTo-Json would drop, so it is patched as text.
+
+# Splits JSON with comments into tokens that remember where they sit in the text. Comments and
+# white space are skipped. Brackets know their partner (Pair). Raises on what it cannot read.
+function Get-JsoncToken {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $tokens = New-Object System.Collections.Generic.List[object]
+    $open   = New-Object System.Collections.Generic.Stack[int]
+    $n = $Text.Length
+    $i = 0
+    while ($i -lt $n) {
+        $ch = $Text[$i]
+        $s  = [string]$ch
+        if ([char]::IsWhiteSpace($ch) -or $ch -eq [char]0xFEFF) { $i++; continue }
+        $next = $(if ($i + 1 -lt $n) { [string]$Text[$i + 1] } else { '' })
+        if ($s -eq '/' -and $next -eq '/') {
+            while ($i -lt $n -and $Text[$i] -ne [char]10) { $i++ }
+            continue
+        }
+        if ($s -eq '/' -and $next -eq '*') {
+            $end = $Text.IndexOf('*/', $i + 2, [StringComparison]::Ordinal)
+            if ($end -lt 0) { throw 'Unterminated comment.' }
+            $i = $end + 2
+            continue
+        }
+        if ($s -eq '"') {
+            $j = $i + 1
+            while ($true) {
+                if ($j -ge $n) { throw 'Unterminated string.' }
+                if ($Text[$j] -eq [char]'\') { $j += 2; continue }
+                if ($Text[$j] -eq [char]'"') { break }
+                $j++
+            }
+            $tokens.Add([pscustomobject]@{ Type = 'string'; Start = $i; End = $j + 1; Text = $Text.Substring($i + 1, $j - $i - 1); Pair = -1 })
+            $i = $j + 1
+            continue
+        }
+        if ('{}[],:'.Contains($s)) {
+            $tokens.Add([pscustomobject]@{ Type = $s; Start = $i; End = $i + 1; Text = $s; Pair = -1 })
+            if ($s -eq '{' -or $s -eq '[') { $open.Push($tokens.Count - 1) }
+            elseif ($s -eq '}' -or $s -eq ']') {
+                if ($open.Count -eq 0) { throw 'Unbalanced brackets.' }
+                $o = $open.Pop()
+                if (($tokens[$o].Type -eq '{') -ne ($s -eq '}')) { throw 'Mismatched brackets.' }
+                $tokens[$o].Pair = $tokens.Count - 1
+                $tokens[$tokens.Count - 1].Pair = $o
+            }
+            $i++
+            continue
+        }
+        $j = $i
+        while ($j -lt $n -and -not ([char]::IsWhiteSpace($Text[$j]) -or '{}[],:"/'.Contains([string]$Text[$j]))) { $j++ }
+        if ($j -eq $i) { throw "Unexpected character at $i." }
+        $tokens.Add([pscustomobject]@{ Type = 'literal'; Start = $i; End = $j; Text = $Text.Substring($i, $j - $i); Pair = -1 })
+        $i = $j
+    }
+    if ($open.Count) { throw 'Unbalanced brackets.' }
+    return $tokens.ToArray()
+}
+
+# The members of the object (or the items of the array) opened by token $Open: where each one
+# starts and ends in the token list, and for an object member its name.
+function Get-JsoncChildren {
+    param([Parameter(Mandatory)]$Tokens, [Parameter(Mandatory)][int]$Open)
+    $isObject = ($Tokens[$Open].Type -eq '{')
+    $close = $Tokens[$Open].Pair
+    $items = New-Object System.Collections.Generic.List[object]
+    $i = $Open + 1
+    while ($i -lt $close) {
+        $key = $null
+        $keyIdx = -1
+        if ($isObject) {
+            if ($Tokens[$i].Type -ne 'string' -or $Tokens[$i + 1].Type -ne ':') { throw 'Expected a name and a colon.' }
+            $key = $Tokens[$i].Text
+            $keyIdx = $i
+            $i += 2
+            if ($i -ge $close) { throw 'Missing value.' }
+        }
+        if (@(',', ':', '}', ']') -contains $Tokens[$i].Type) { throw 'Expected a value.' }
+        $last = $(if ($Tokens[$i].Pair -ge 0) { $Tokens[$i].Pair } else { $i })
+        $items.Add([pscustomobject]@{ Key = $key; KeyIdx = $keyIdx; First = $i; Last = $last })
+        $i = $last + 1
+        if ($i -lt $close) {
+            if ($Tokens[$i].Type -ne ',') { throw 'Expected a comma.' }
+            $i++
+        }
+    }
+    return $items.ToArray()
+}
+
+# Returns $Text with the CLAUDE_CONFIG_DIR entry of claudeCode.environmentVariables set to
+# $ConfigDir, or removed when $ConfigDir is empty. Everything else in the text, comments
+# included, is left exactly as it was. Raises when the text is not a JSON object it can read.
+function Update-VsCodeSettingsText {
+    param([string]$Text, [string]$ConfigDir)
+    $key = 'claudeCode.environmentVariables'
+    $var = 'CLAUDE_CONFIG_DIR'
+    if ($null -eq $Text) { $Text = '' }
+    $remove = [string]::IsNullOrEmpty($ConfigDir)
+    $nl = $(if ($Text.Contains("`r`n")) { "`r`n" } elseif ($Text.Contains("`n")) { "`n" } else { "`r`n" })
+    $quoted = $(if ($remove) { '' } else { '"' + (($ConfigDir -replace '\\', '\\') -replace '"', '\"') + '"' })
+    $entry = '{ "name": "' + $var + '", "value": ' + $quoted + ' }'
+
+    $tokens = @(Get-JsoncToken -Text $Text)
+    if ($tokens.Count -eq 0) {
+        if ($remove) { return $Text }
+        return $Text + '{' + $nl + '    "' + $key + '": [' + $nl + '        ' + $entry + $nl + '    ]' + $nl + '}' + $nl
+    }
+    if ($tokens[0].Type -ne '{' -or $tokens[0].Pair -ne $tokens.Count - 1) { throw 'The settings file is not a single JSON object.' }
+
+    $edits = New-Object System.Collections.Generic.List[object]
+    $add = { param($Pos, $Len, $Ins) $edits.Add([pscustomobject]@{ Pos = $Pos; Len = $Len; Ins = $Ins; Seq = $edits.Count }) }
+    $root = @(Get-JsoncChildren -Tokens $tokens -Open 0)
+    $member = $root | Where-Object { $_.Key -ceq $key } | Select-Object -First 1
+
+    if ($member) {
+        $arr = $member.First
+        if ($tokens[$arr].Type -ne '[') { throw "$key is not a list." }
+        $items = @(Get-JsoncChildren -Tokens $tokens -Open $arr)
+        $hit = -1
+        for ($k = 0; $k -lt $items.Count; $k++) {
+            if ($tokens[$items[$k].First].Type -ne '{') { continue }
+            $name = @(Get-JsoncChildren -Tokens $tokens -Open $items[$k].First) | Where-Object { $_.Key -ceq 'name' } | Select-Object -First 1
+            if ($name -and $tokens[$name.First].Type -eq 'string' -and $tokens[$name.First].Text -ceq $var) { $hit = $k; break }
+        }
+        if ($hit -ge 0) {
+            $item = $items[$hit]
+            $from = $tokens[$item.First].Start
+            $to   = $tokens[$item.Last].End
+            if ($remove) {
+                $after = $tokens[$item.Last + 1]
+                if ($after.Type -eq ',') {
+                    # Its own comma goes with it, and the white space up to whatever follows.
+                    $stop = $after.End
+                    while ($stop -lt $Text.Length -and [char]::IsWhiteSpace($Text[$stop])) { $stop++ }
+                    & $add $from ($stop - $from) ''
+                } elseif ($hit -gt 0) {
+                    # The last one: the comma before it goes instead.
+                    $comma = $tokens[$items[$hit - 1].Last + 1].Start
+                    & $add $comma ($to - $comma) ''
+                } else {
+                    & $add $from ($to - $from) ''
+                }
+            } else {
+                $value = @(Get-JsoncChildren -Tokens $tokens -Open $item.First) | Where-Object { $_.Key -ceq 'value' } | Select-Object -First 1
+                if (-not $value) { throw "The existing $var entry has no value." }
+                $vFrom = $tokens[$value.First].Start
+                & $add $vFrom ($tokens[$value.Last].End - $vFrom) $quoted
+            }
+        } elseif (-not $remove) {
+            if ($items.Count -eq 0) { & $add $tokens[$arr].End 0 (' ' + $entry + ' ') }
+            else { & $add $tokens[$items[$items.Count - 1].Last].End 0 (', ' + $entry) }
+        }
+    } elseif (-not $remove) {
+        # New setting, laid out like the first one already in the file.
+        $indent = '    '
+        if ($root.Count -gt 0) {
+            $at = $tokens[$root[0].KeyIdx].Start
+            $b = $at
+            while ($b -gt 0 -and ($Text[$b - 1] -eq [char]32 -or $Text[$b - 1] -eq [char]9)) { $b-- }
+            if ($b -gt 0 -and $Text[$b - 1] -eq [char]10) { $indent = $Text.Substring($b, $at - $b) }
+        }
+        $block = $nl + $indent + '"' + $key + '": [' + $nl + $indent + $indent + $entry + $nl + $indent + ']'
+        # Goes in just before the closing brace's white space, so a comment trailing the last
+        # setting stays on its line.
+        $p = $tokens[$tokens.Count - 1].Start
+        while ($p -gt 0 -and [char]::IsWhiteSpace($Text[$p - 1])) { $p-- }
+        if ($root.Count -eq 0) {
+            & $add $p 0 ($block + $nl)
+        } else {
+            $lastMember = $root[$root.Count - 1]
+            if ($tokens[$lastMember.Last + 1].Type -ne ',') { & $add $tokens[$lastMember.Last].End 0 ',' }
+            & $add $p 0 $block
+        }
+    }
+
+    $result = $Text
+    foreach ($e in ($edits | Sort-Object @{ Expression = { $_.Pos }; Descending = $true }, @{ Expression = { $_.Seq }; Descending = $true })) {
+        $result = $result.Substring(0, $e.Pos) + $e.Ins + $result.Substring($e.Pos + $e.Len)
+    }
+    return $result
+}
+
+function Get-VsCodeSettingsPath {
+    return (Join-Path $env:APPDATA 'Code\User\settings.json')
+}
+
+# Points the Claude extension at $ConfigDir (or back at ~/.claude when empty). The earlier file is
+# kept under .switcher\vscode-backups first. Returns 'updated' or 'unchanged'; raises, leaving
+# the file as it was, when the file cannot be read as settings.
+function Set-VsCodeClaudeConfigDir {
+    param([string]$ConfigDir, [string]$SettingsFile = (Get-VsCodeSettingsPath))
+    $old = $null
+    if (Test-Path -LiteralPath $SettingsFile) { $old = [IO.File]::ReadAllText($SettingsFile) }
+    $new = Update-VsCodeSettingsText -Text $old -ConfigDir $ConfigDir
+    if ($null -eq $old) {
+        if ([string]::IsNullOrEmpty($ConfigDir)) { return 'unchanged' }
+    } elseif ($new -ceq $old) {
+        return 'unchanged'
+    }
+    $utf8 = New-Object Text.UTF8Encoding($false)
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $SettingsFile) | Out-Null
+    if ($null -ne $old) {
+        $keep = Join-Path $script:SwitcherHome 'vscode-backups'
+        New-Item -ItemType Directory -Force -Path $keep | Out-Null
+        [IO.File]::WriteAllText((Join-Path $keep ('settings-{0}.json' -f (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))), $old, $utf8)
+        Get-ChildItem -LiteralPath $keep -File | Sort-Object Name -Descending | Select-Object -Skip 5 | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+    [IO.File]::WriteAllText($SettingsFile, $new, $utf8)
+    return 'updated'
+}
+
+# Where one account's Claude Code login lives, from settings.json:
+#   "ProfileCode": { "<profile id>": { "ConfigDir": "C:\\full\\path" } }
+# Unless set, Default uses Claude Code's own ~\.claude and every other account gets
+# ~\.claude-<id>. EnvDir is what CLAUDE_CONFIG_DIR is set to; $null means leave it unset.
+# StateFile is the .claude.json that holds the signed-in account's name and email.
+function Get-ProfileCodeConfig {
+    param([Parameter(Mandatory)][string]$Id)
+    $userHome = [Environment]::GetFolderPath('UserProfile')
+    $set = (Get-Setting 'ProfileCode').$Id
+    $dir = $null
+    if ($set -and $set.ConfigDir) { $dir = [string]$set.ConfigDir }
+    elseif ($Id -ne $script:DefaultName) { $dir = Join-Path $userHome ('.claude-' + $Id) }
+    return [pscustomobject]@{
+        EnvDir    = $dir
+        Folder    = $(if ($dir) { $dir } else { Join-Path $userHome '.claude' })
+        StateFile = $(if ($dir) { Join-Path $dir '.claude.json' } else { Join-Path $userHome '.claude.json' })
+    }
+}
+
+# Who a Claude Code folder is signed in as: the email and organization Claude Code keeps beside
+# the login in .claude.json. The credentials file is never opened. $null when nobody is.
+function Get-ClaudeAccountInfo {
+    param([Parameter(Mandatory)][string]$StateFile)
+    if (-not (Test-Path -LiteralPath $StateFile)) { return $null }
+    try {
+        $raw = Get-Content -LiteralPath $StateFile -Raw
+        $email = $null
+        $org = $null
+        try {
+            $acct = ($raw | ConvertFrom-Json).oauthAccount
+            if ($acct) { $email = [string]$acct.emailAddress; $org = [string]$acct.organizationName }
+        } catch {
+            # Windows PowerShell 5.1 refuses a very large .claude.json; the two values are
+            # still easy to find in the text.
+            if ($raw -match '"emailAddress"\s*:\s*"([^"]+)"') { $email = $Matches[1] }
+            if ($raw -match '"organizationName"\s*:\s*"([^"]*)"') { $org = $Matches[1] }
+        }
+        if ($email) { return [pscustomobject]@{ Email = $email; Organization = $org } }
+    } catch { }
+    return $null
+}
+
+function Test-VsCodeSyncOn { return ((Get-Setting 'VsCodeSync') -eq $true) }
+
+# Points the VS Code Claude extension at one account's Claude Code folder. Default goes back to
+# the extension's own default (~\.claude) by removing our entry. Never raises: returns the
+# sentence to show, or $null when VS Code is not involved. -Force applies it even with the
+# sync switched off, for an explicit request.
+function Sync-VsCodeAccount {
+    param([Parameter(Mandatory)][string]$Id, [switch]$Force)
+    if (-not $Force -and -not (Test-VsCodeSyncOn)) { return $null }
+    try {
+        $cfg = Get-ProfileCodeConfig -Id $Id
+        # The extension ignores a relative path and does not expand ~.
+        if ($cfg.EnvDir -and $cfg.EnvDir -notmatch '^([A-Za-z]:[\\/]|\\\\)') {
+            throw "The ConfigDir for '$Id' must be a full path, such as C:\Users\you\.claude-work."
+        }
+        $changed = (Set-VsCodeClaudeConfigDir -ConfigDir $cfg.EnvDir) -eq 'updated'
+        Set-Setting 'CodeAccount' $Id
+        $target = Resolve-ClaudeProfile -Name $Id -SkipStatus
+        $label = $(if ($target) { $target.Name } else { $Id })
+        $who = Get-ClaudeAccountInfo -StateFile $cfg.StateFile
+        # Short enough for the window's status line. Chats already open in VS Code keep their
+        # account; the README says to start a new one.
+        $signed = $(if ($who) {
+            $who.Email + $(if ($who.Organization) { " ($($who.Organization))" })
+        } else { 'not signed in yet' })
+        return "VS Code uses '$label': $signed."
+    } catch {
+        return "Could not update VS Code: $($_.Exception.Message)"
+    }
+}
+
+# Opens a terminal where Claude Code uses this account's folder, so /login signs that account
+# in once. The sign-in itself happens in Claude Code and the browser: nothing here sees it.
+function Start-ClaudeCodeLogin {
+    param([Parameter(Mandatory)][string]$Id, [string]$Name = $Id)
+    if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
+        throw "The 'claude' command (Claude Code) was not found on PATH.`r`n`r`nYou can sign in from VS Code instead: switch to this account, then open the Claude panel there and sign in."
+    }
+    $cfg = Get-ProfileCodeConfig -Id $Id
+    $setEnv = ''
+    if ($cfg.EnvDir) {
+        New-Item -ItemType Directory -Force -Path $cfg.EnvDir | Out-Null
+        $dirText = $cfg.EnvDir -replace "'", "''"
+        $setEnv = "`$env:CLAUDE_CONFIG_DIR = '$dirText'; "
+    }
+    $label = $Name -replace "'", "''"
+    $cmd = $setEnv + "Write-Host 'Signing in the Claude Code account for $label. When Claude starts, type /login and finish in the browser.'; claude"
+    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
+    Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoExit', '-NoProfile', '-EncodedCommand', $enc)
+}
+
+# Opens or focuses the account's Claude window, then, with the sync on, points VS Code at the
+# same account. The note for the user is left in $script:CodeSyncNote.
 function Start-ClaudeProfile {
+    param([Parameter(Mandatory)][string]$Id, [switch]$NoCodeSync)
+    $how = Open-ClaudeProfileWindow -Id $Id
+    $script:CodeSyncNote = $(if ($NoCodeSync) { $null } else { Sync-VsCodeAccount -Id $Id })
+    return $how
+}
+
+# Returns 'focused' when the profile was already open, 'started' otherwise.
+function Open-ClaudeProfileWindow {
     param([Parameter(Mandatory)][string]$Id)
 
     $path = Get-ProfilePath -Id $Id
@@ -1237,6 +1561,14 @@ function Remove-ClaudeProfile {
     Get-ChildItem -LiteralPath $script:IconDir -Filter '*.ico' -ErrorAction SilentlyContinue |
         Where-Object { $_.BaseName -match $stale } | Remove-Item -Force -ErrorAction SilentlyContinue
     Set-ProfileLabel -Id $Target.Id -Label $null
+    # The Claude Code folder holds a login, so it stays; only the switcher's note about it goes,
+    # so a later account with the same id does not inherit it.
+    $code = Get-Setting 'ProfileCode'
+    if ($code -and $code.PSObject.Properties[$Target.Id]) {
+        $keep = @{}
+        foreach ($p in $code.PSObject.Properties) { if ($p.Name -ne $Target.Id) { $keep[$p.Name] = $p.Value } }
+        Set-Setting 'ProfileCode' $(if ($keep.Count) { $keep } else { $null })
+    }
 }
 
 function Install-Switcher {
@@ -1987,6 +2319,36 @@ if ($PSBoundParameters.ContainsKey('OpenLinksIn')) {
     return
 }
 
+if ($PSBoundParameters.ContainsKey('VsCodeSync')) {
+    switch ($VsCodeSync.Trim().ToLowerInvariant()) {
+        'on'    { Set-Setting 'VsCodeSync' $true;  'VS Code follows the account you launch or switch to.' }
+        'off'   { Set-Setting 'VsCodeSync' $false; 'VS Code no longer follows the switcher. It keeps the account it has now.' }
+        default { throw "Use -VsCodeSync on or -VsCodeSync off." }
+    }
+    return
+}
+
+if ($PSBoundParameters.ContainsKey('VsCode')) {
+    $target = Resolve-ClaudeProfile -Name $VsCode -SkipStatus
+    if (-not $target) {
+        $known = (Get-ProfileList -SkipStatus | ForEach-Object { $_.Name }) -join ', '
+        throw "There is no Claude profile called '$VsCode'.`r`n`r`nProfiles: $known"
+    }
+    Sync-VsCodeAccount -Id $target.Id -Force
+    return
+}
+
+if ($PSBoundParameters.ContainsKey('CodeLogin')) {
+    $target = Resolve-ClaudeProfile -Name $CodeLogin -SkipStatus
+    if (-not $target) {
+        $known = (Get-ProfileList -SkipStatus | ForEach-Object { $_.Name }) -join ', '
+        throw "There is no Claude profile called '$CodeLogin'.`r`n`r`nProfiles: $known"
+    }
+    Start-ClaudeCodeLogin -Id $target.Id -Name $target.Name
+    "A terminal opened for '$($target.Name)'. Type /login there and finish in the browser."
+    return
+}
+
 if ($Status) {
     $backup = $(if (Test-Path -LiteralPath $script:HandlerBackupPath) { $script:HandlerBackupPath } else { 'none' })
     "Sign-in routing:  $(Get-RouterStateText)"
@@ -2000,6 +2362,15 @@ if ($Status) {
         $signedIn = Test-ProfileSignedIn -Path (Get-ProfileDataPath -Target $p)
         $state = $(if ($signedIn) { 'signed in' } elseif ($signedIn -eq $false) { 'signed out' } else { 'unknown' })
         '  {0,-24} pid {1,-7} {2}' -f $p.Name, $p.Pid, $state
+    }
+    ''
+    "VS Code sync:     $(if (Test-VsCodeSyncOn) { 'on' } else { 'off' })"
+    "VS Code account:  $(if ($ca = Get-Setting 'CodeAccount') { $ca } else { 'not set by the switcher' })"
+    'Claude Code folders (what the VS Code extension signs in with):'
+    foreach ($p in @(Get-ProfileList -SkipStatus)) {
+        $cfg = Get-ProfileCodeConfig -Id $p.Id
+        $who = Get-ClaudeAccountInfo -StateFile $cfg.StateFile
+        '  {0,-24} {1}  {2}' -f $p.Name, $cfg.Folder, $(if ($who) { $who.Email + $(if ($who.Organization) { " ($($who.Organization))" }) } else { 'not signed in' })
     }
     return
 }
@@ -2048,6 +2419,7 @@ if ($Launch) {
         throw "There is no Claude profile called '$Launch'.`r`n`r`nProfiles: $known"
     }
     $how = Start-ClaudeProfile -Id $target.Id
+    if ($script:CodeSyncNote) { $script:CodeSyncNote }
     if ($how -eq 'started' -and -not $target.IsDefault) {
         # The window first: its identity has to be set before it is shown.
         try {
@@ -2187,6 +2559,7 @@ $statusLine.Font      = $fontSmall
 $statusLine.ForeColor = $muted
 $statusLine.Location  = New-Object System.Drawing.Point(21, 398)
 $statusLine.Size      = New-Object System.Drawing.Size(500, 18)
+$statusLine.AutoEllipsis = $true
 $statusLine.Anchor    = 'Left,Right,Bottom'
 $form.Controls.Add($statusLine)
 
@@ -2387,9 +2760,33 @@ function Invoke-LaunchProfile {
         $how = Start-ClaudeProfile -Id $Target.Id
         if ($how -eq 'started') { Add-IdentityWatch -Target $Target }
         # The refresh timer flips the row to Running once the window is up.
-        $statusLine.Text = $(if ($how -eq 'focused') { "Switched to '$($Target.Name)'." } else { "Starting '$($Target.Name)'..." })
+        $statusLine.Text = $(if ($how -eq 'focused') { "Switched to '$($Target.Name)'." } else { "Starting '$($Target.Name)'..." }) +
+            $(if ($script:CodeSyncNote) { ' ' + $script:CodeSyncNote })
     } catch {
         Show-Message $_.Exception.Message 'Could not launch' 'OK' 'Error' | Out-Null
+    }
+}
+
+function Switch-VsCodeSync {
+    $on = -not (Test-VsCodeSyncOn)
+    Set-Setting 'VsCodeSync' $on
+    $statusLine.Text = $(if ($on) { 'VS Code will follow the account you launch or switch to.' } else { 'VS Code no longer follows the switcher.' })
+}
+
+function Invoke-UseForVsCode {
+    $p = Get-SelectedProfile
+    if (-not $p) { return }
+    $statusLine.Text = Sync-VsCodeAccount -Id $p.Id -Force
+}
+
+function Invoke-CodeLogin {
+    $p = Get-SelectedProfile
+    if (-not $p) { return }
+    try {
+        Start-ClaudeCodeLogin -Id $p.Id -Name $p.Name
+        $statusLine.Text = "A terminal opened for '$($p.Name)': type /login there and finish in the browser."
+    } catch {
+        Show-Message $_.Exception.Message 'Could not start the sign-in' 'OK' 'Error' | Out-Null
     }
 }
 
@@ -2648,10 +3045,15 @@ $null       = Add-MenuItem $menu 'Add shortcuts'          { Invoke-AddShortcuts 
 $null       = Add-MenuItem $menu 'Transfer Code chats...' { $btnTransfer.PerformClick() }
 $null       = Add-MenuItem $menu 'Open folder'            { Invoke-OpenFolder }
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+$miCodeSync = Add-MenuItem $menu 'VS Code follows the account I switch to' { Switch-VsCodeSync }
+$null       = Add-MenuItem $menu 'Use for VS Code now'    { Invoke-UseForVsCode }
+$null       = Add-MenuItem $menu 'Sign in Claude Code for VS Code...' { Invoke-CodeLogin }
+$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 $miDelete   = Add-MenuItem $menu 'Delete'                 { Invoke-DeleteProfile } 'Del'
 $menu.Add_Opening({
     $p = Get-SelectedProfile
     if (-not $p) { $_.Cancel = $true; return }
+    $miCodeSync.Checked = (Test-VsCodeSyncOn)
     $miLaunch.Text    = $(if ($p.Pid) { 'Switch to' } else { 'Launch' })
     $miDelete.Enabled = -not $p.IsDefault
 })
@@ -2734,6 +3136,8 @@ $trayMenu.Add_Opening({
     $boot.Checked = (Test-Path -LiteralPath (Get-StartupShortcutPath))
     $route = Add-MenuItem $trayMenu 'Send sign-ins to the right account' { Switch-SignInRouting }
     $route.Checked = (Test-SignInRoutingOn)
+    $codeSync = Add-MenuItem $trayMenu 'VS Code follows the account I switch to' { Switch-VsCodeSync }
+    $codeSync.Checked = (Test-VsCodeSyncOn)
     $trayMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
     $null = Add-MenuItem $trayMenu 'Exit' { Exit-Switcher }
     $_.Cancel = $false

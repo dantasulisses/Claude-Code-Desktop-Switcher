@@ -166,6 +166,38 @@ They go on every launch of that account, from the window, the tray, its shortcut
 same two limits apply: a copy that is already open keeps the flags it started with, and
 `Default` on the Store build starts through the shell, which takes none.
 
+### The VS Code Claude extension follows the account
+
+The Claude extension for VS Code signs in with Claude Code's own login, kept in a config
+folder (`~\.claude` unless `CLAUDE_CONFIG_DIR` says otherwise), not in the desktop
+profiles. With this switched on, launching or switching to an account in the switcher also
+points the extension at that account's folder. It does this by setting `CLAUDE_CONFIG_DIR` in
+the extension's `claudeCode.environmentVariables` setting in your VS Code **user**
+`settings.json`, which the extension follows without a window reload. Comments and the rest of
+that file are left as they are, and the file is copied to
+`%LOCALAPPDATA%\ClaudeProfiles\.switcher\vscode-backups` first.
+
+It is off until you turn it on: tick **VS Code follows the account I switch to** in the
+right-click menu or the tray, or run `-VsCodeSync on`. Then:
+
+1. `Default` uses `~\.claude`, as Claude Code does on its own, and every other account uses
+   its own folder, `~\.claude-<folder name>`. Override one with
+   `"ProfileCode": { "Work": { "ConfigDir": "C:\\Users\\you\\.claude-work" } }` in
+   `settings.json` (a full path: the extension does not expand `~`).
+2. Sign each account in once. Right-click it and choose **Sign in Claude Code for VS Code...**
+   (or `-CodeLogin Work`). A terminal opens with that account's folder selected: type `/login`
+   and finish in the browser. This needs the `claude` command on PATH; without it, switch to the
+   account and sign in from the Claude panel in VS Code instead. The switcher never sees your
+   password or tokens, and never copies them.
+3. From then on, launching an account in the switcher moves VS Code to it. `-VsCode Work`
+   does the same by hand, and `-Status` shows each folder and who is signed in there.
+
+> [!NOTE]
+> Chats that are already open in VS Code keep the account they started with: start a new
+> chat to use the new one. Only the extension follows; the `claude` command in a terminal is
+> not touched. If your organization sets `forceLoginOrgUUID` in managed settings, signing in to
+> another organization can be refused.
+
 ## Command line
 
 | Command | Does |
@@ -184,6 +216,9 @@ same two limits apply: a copy that is already open keeps the flags it started wi
 | `.\ClaudeSwitcher.ps1 -Revert` | Turn sign-in routing off and put the original `claude://` handler back |
 | `.\ClaudeSwitcher.ps1 -OpenLink <url> -Account Work` | Open a `claude://` link in a chosen account |
 | `.\ClaudeSwitcher.ps1 -OpenLinksIn Work` | Send `claude://` links that are not sign-ins to that account from now on; `Default` undoes it |
+| `.\ClaudeSwitcher.ps1 -VsCodeSync on` | Make the VS Code Claude extension follow the account you launch (`off` stops it) |
+| `.\ClaudeSwitcher.ps1 -VsCode Work` | Point the VS Code Claude extension at that account now |
+| `.\ClaudeSwitcher.ps1 -CodeLogin Work` | Open a terminal to sign that account in to Claude Code, once |
 
 `-Launch` and `-Shortcut` accept either a profile's name or its folder name.
 
@@ -321,8 +356,10 @@ outside the switcher, its old shortcut will report that the profile no longer ex
 - Each account that runs Cowork tasks locally starts its own Linux VM, which takes 4 GB of
   memory while it runs and over 10 GB of disk in that profile's folder. Tasks run in the
   cloud need neither.
-- This is about the desktop app only. The `claude` CLI uses its own `CLAUDE_CONFIG_DIR`
-  environment variable for the same purpose.
+- The accounts are desktop profiles. Beyond the opt-in
+  [VS Code extension sync](#the-vs-code-claude-extension-follows-the-account), the `claude`
+  command in a terminal is not switched: it uses its own `CLAUDE_CONFIG_DIR` environment
+  variable for the same purpose.
 </details>
 
 ## Star history

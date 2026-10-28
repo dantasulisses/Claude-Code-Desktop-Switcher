@@ -73,6 +73,14 @@ jobs:
         shell: pwsh
         run: .\tests\ProfileLaunch.Tests.ps1
 
+      - name: VS Code sync tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\VsCodeSync.Tests.ps1
+
+      - name: VS Code sync tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\VsCodeSync.Tests.ps1
+
       - name: Install PSScriptAnalyzer
         shell: pwsh
         run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
