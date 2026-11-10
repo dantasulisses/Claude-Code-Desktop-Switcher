@@ -3,7 +3,7 @@ $source = Join-Path (Split-Path $PSScriptRoot -Parent) 'ClaudeSwitcher.ps1'
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($source, [ref]$null, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-foreach ($name in @('Invoke-WithProfileEnv', 'Get-ProfileArgs', 'Get-LaunchArgLine', 'Get-OtherLinkTarget', 'Test-SafeLink')) {
+foreach ($name in @('Invoke-WithProfileEnv', 'Get-ProfileCodeConfig', 'Get-ProfileArgs', 'Get-LaunchArgLine', 'Get-OtherLinkTarget', 'Test-SafeLink')) {
     $node = $ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name}, $true)
     if (-not $node) { throw "Missing function: $name" }
     . ([scriptblock]::Create($node.Extent.Text))
@@ -45,6 +45,29 @@ try { Invoke-WithProfileEnv -Id 'Work' { throw 'launch failed' } } catch { }
 Assert ($null -eq [Environment]::GetEnvironmentVariable($var, 'Process')) 'Variable kept after a failed launch'
 $script:Settings = @{}
 Invoke-WithProfileEnv -Id 'Work' { Assert ($null -eq [Environment]::GetEnvironmentVariable($var, 'Process')) 'Variable set without a setting' }
+
+# Each account's desktop app gets its own Claude Code folder, so its Code tab never writes
+# into another account's. Default gets none, even when this process has one.
+$cfgVar = 'CLAUDE_CONFIG_DIR'
+$keep = [Environment]::GetEnvironmentVariable($cfgVar, 'Process')
+$userHome = [Environment]::GetFolderPath('UserProfile')
+try {
+    [Environment]::SetEnvironmentVariable($cfgVar, 'C:\inherited', 'Process')
+    Invoke-WithProfileEnv -Id 'Work' { Assert ([Environment]::GetEnvironmentVariable($cfgVar, 'Process') -eq (Join-Path $userHome '.claude-Work')) 'Work launched without its Claude Code folder' }
+    Invoke-WithProfileEnv -Id 'Default' { Assert ($null -eq [Environment]::GetEnvironmentVariable($cfgVar, 'Process')) 'Default launched with a Claude Code folder' }
+    Assert ([Environment]::GetEnvironmentVariable($cfgVar, 'Process') -eq 'C:\inherited') 'Inherited CLAUDE_CONFIG_DIR not restored'
+    $script:Settings = @{ ProfileCode = [pscustomobject]@{ Work = [pscustomobject]@{ ConfigDir = 'E:\cc-work' } } }
+    Invoke-WithProfileEnv -Id 'Work' { Assert ([Environment]::GetEnvironmentVariable($cfgVar, 'Process') -eq 'E:\cc-work') 'ProfileCode folder ignored' }
+    $script:Settings = @{ ProfileEnv = [pscustomobject]@{ Work = [pscustomobject]@{ CLAUDE_CONFIG_DIR = 'F:\mine' } } }
+    Invoke-WithProfileEnv -Id 'Work' { Assert ([Environment]::GetEnvironmentVariable($cfgVar, 'Process') -eq 'F:\mine') 'ProfileEnv CLAUDE_CONFIG_DIR did not win' }
+    [Environment]::SetEnvironmentVariable($cfgVar, [NullString]::Value, 'Process')
+    $script:Settings = @{}
+    Invoke-WithProfileEnv -Id 'Work' { }
+    Assert ($null -eq [Environment]::GetEnvironmentVariable($cfgVar, 'Process')) 'CLAUDE_CONFIG_DIR left set after the launch'
+} finally {
+    [Environment]::SetEnvironmentVariable($cfgVar, $(if ($null -eq $keep) { [NullString]::Value } else { $keep }), 'Process')
+    $script:Settings = @{}
+}
 
 # Extra flags per account.
 Assert ((Get-ProfileArgs -Id 'Work') -eq '') 'Flags without a setting'

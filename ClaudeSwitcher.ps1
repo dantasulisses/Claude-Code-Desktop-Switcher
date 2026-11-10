@@ -529,16 +529,26 @@ function Show-ProfileWindow {
 # Runs $Action with the profile's ProfileEnv variables set in this process, so the Claude
 # it starts inherits them, then puts the previous values back (or removes them), so a
 # later launch of another profile from this process does not get them too.
+# CLAUDE_CONFIG_DIR is always set to the account's Claude Code folder (removed for Default,
+# whose folder is ~\.claude), so the desktop app's Code tab keeps its chats and its "signed
+# in as" record in that account's folder. Without it every profile's Code tab writes into
+# ~\.claude, and VS Code and OpenWhispr then show the wrong account for Default. A
+# CLAUDE_CONFIG_DIR in ProfileEnv still wins.
 function Invoke-WithProfileEnv {
     param([Parameter(Mandatory)][string]$Id, [Parameter(Mandatory)][scriptblock]$Action)
-    $saved = @{}
+    $wanted = [ordered]@{ CLAUDE_CONFIG_DIR = (Get-ProfileCodeConfig -Id $Id).EnvDir }
     $vars  = (Get-Setting 'ProfileEnv').$Id
     if ($vars) {
         foreach ($p in $vars.PSObject.Properties) {
-            if ($p.Name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$' -or $saved.ContainsKey($p.Name)) { continue }
-            $saved[$p.Name] = [Environment]::GetEnvironmentVariable($p.Name, 'Process')
-            [Environment]::SetEnvironmentVariable($p.Name, [string]$p.Value, 'Process')
+            if ($p.Name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { continue }
+            $wanted[$p.Name] = [string]$p.Value
         }
+    }
+    $saved = @{}
+    foreach ($n in $wanted.Keys) {
+        $saved[$n] = [Environment]::GetEnvironmentVariable($n, 'Process')
+        $value = $(if ($null -eq $wanted[$n]) { [NullString]::Value } else { $wanted[$n] })
+        [Environment]::SetEnvironmentVariable($n, $value, 'Process')
     }
     try { & $Action }
     finally {
@@ -871,11 +881,159 @@ function Sync-VsCodeAccount {
     }
 }
 
+# ---- OpenWhispr
+# The OpenWhispr proxy ships with the switcher, in the openwhispr folder next to this script
+# (installed to .switcher\openwhispr). It is a small Node server on 127.0.0.1:8787 that lets the
+# OpenWhispr dictation app clean up text with Claude Haiku, signed in as one account. The switcher
+# starts it with itself, stops it on exit, and tells it which account to use by writing
+# account.json, which the proxy watches: { "configDir": <that account's CLAUDE_CONFIG_DIR, null
+# for ~\.claude>, ... }.
+# Settings: OpenWhisprOn (start it with the switcher, default on), OpenWhisprFollow (follow the
+# account I switch to, default on), OpenWhisprAccount, and OpenWhisprProxyPath (optional, set
+# by hand: another proxy folder, for development).
+$script:WhisprDataDir     = Join-Path $script:ProfileRoot '.openwhispr'
+$script:WhisprAccountFile = Join-Path $script:WhisprDataDir 'account.json'
+$script:WhisprPidFile     = Join-Path $script:WhisprDataDir 'proxy.pid'
+$script:WhisprUrl         = 'http://127.0.0.1:8787'
+$script:WhisprMissing     = 'The OpenWhispr proxy files are missing next to the switcher. Run the switcher with -Install again.'
+
+function Test-WhisprOn     { return ((Get-Setting 'OpenWhisprOn') -ne $false) }
+function Test-WhisprFollow { return ((Get-Setting 'OpenWhisprFollow') -ne $false) }
+
+# The folder holding the proxy's server.mjs: OpenWhisprProxyPath when set, else the openwhispr
+# folder next to this script. $null when neither has it, which hides the feature.
+function Get-WhisprPath {
+    $override = [string](Get-Setting 'OpenWhisprProxyPath')
+    $path = $(if ($override) { $override } else { Join-Path (Split-Path $script:ScriptPath -Parent) 'openwhispr' })
+    if (Test-Path -LiteralPath (Join-Path $path 'server.mjs')) { return $path }
+    return $null
+}
+
+# Copies the proxy's .mjs files next to the installed script, replacing the old ones (a file
+# dropped from a later version must not linger). A running proxy keeps its loaded code until
+# it restarts. Nothing to do when the source has no proxy, as when only the .ps1 was copied.
+function Install-WhisprProxy {
+    param([Parameter(Mandatory)][string]$From, [Parameter(Mandatory)][string]$To)
+    if (-not (Test-Path -LiteralPath (Join-Path $From 'server.mjs'))) { return $false }
+    New-Item -ItemType Directory -Force -Path $To | Out-Null
+    Get-ChildItem -LiteralPath $To -Filter *.mjs -File | Remove-Item -Force
+    foreach ($f in Get-ChildItem -LiteralPath $From -Filter *.mjs -File) {
+        Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $To $f.Name) -Force
+        try { Unblock-File -LiteralPath (Join-Path $To $f.Name) } catch { }
+    }
+    return $true
+}
+
+# The account the proxy is told to use. One that no longer exists falls back to Default.
+function Get-WhisprAccountId {
+    param([string[]]$KnownIds)
+    $id = [string](Get-Setting 'OpenWhisprAccount')
+    if ($id -and ($KnownIds -contains $id)) { return $id }
+    return $script:DefaultName
+}
+
+# Writes account.json for one account. Returns $true when the file changed. Written to a
+# temp file and renamed, so the proxy never reads half a file.
+function Write-WhisprAccountFile {
+    param([Parameter(Mandatory)][string]$Id, [string]$Label = $Id)
+    $cfg = Get-ProfileCodeConfig -Id $Id
+    $json = [ordered]@{ configDir = $cfg.EnvDir; label = $Label; profileId = $Id } | ConvertTo-Json -Compress
+    if ((Test-Path -LiteralPath $script:WhisprAccountFile) -and
+        ([IO.File]::ReadAllText($script:WhisprAccountFile) -eq $json)) { return $false }
+    New-Item -ItemType Directory -Force -Path (Split-Path $script:WhisprAccountFile -Parent) | Out-Null
+    $tmp = $script:WhisprAccountFile + '.tmp'
+    [IO.File]::WriteAllText($tmp, $json, (New-Object Text.UTF8Encoding $false))
+    Move-Item -LiteralPath $tmp -Destination $script:WhisprAccountFile -Force
+    return $true
+}
+
+# Points the proxy at one account and remembers it. Returns the account's display name.
+function Set-WhisprAccount {
+    param([Parameter(Mandatory)][string]$Id)
+    $target = Resolve-ClaudeProfile -Name $Id -SkipStatus
+    if (-not $target) { $target = Resolve-ClaudeProfile -Name $script:DefaultName -SkipStatus }
+    Set-Setting 'OpenWhisprAccount' $target.Id
+    Write-WhisprAccountFile -Id $target.Id -Label $target.Name | Out-Null
+    return $target.Name
+}
+
+# Called on every switch. Never raises: a problem here must not stop the switch itself.
+function Update-WhisprOnSwitch {
+    param([Parameter(Mandatory)][string]$Id)
+    if (-not (Get-WhisprPath) -or -not (Test-WhisprFollow)) { return }
+    try { Set-WhisprAccount -Id $Id | Out-Null } catch { Write-WhisprLog "Could not follow '$Id': $($_.Exception.Message)" }
+}
+
+function Write-WhisprLog {
+    param([string]$Message)
+    try { Add-Content -LiteralPath $script:LogPath -Value ('[{0}] OpenWhispr: {1}' -f (Get-Date -Format 's'), $Message) } catch { }
+}
+
+# What the proxy itself reports: running or not, and the account it is really using.
+function Get-WhisprStatus {
+    try {
+        $h = Invoke-RestMethod -Uri ($script:WhisprUrl + '/health') -TimeoutSec 1
+        return [pscustomobject]@{ Running = $true; Pid = $h.pid; Label = $h.account.label; Organization = $h.account.organization; SignedIn = [bool]$h.account.signedIn }
+    } catch {
+        return [pscustomobject]@{ Running = $false; Pid = $null; Label = $null; Organization = $null; SignedIn = $false }
+    }
+}
+
+# Starts the proxy hidden unless it already answers. Raises with a readable message.
+function Start-Whispr {
+    $path = Get-WhisprPath
+    if (-not $path) { throw $script:WhisprMissing }
+    if ((Get-WhisprStatus).Running) { return 'already running' }
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $node) { throw "Node.js ('node') was not found on PATH, and the OpenWhispr proxy needs it." }
+    Start-Process -FilePath $node.Source -ArgumentList @('server.mjs') -WorkingDirectory $path -WindowStyle Hidden | Out-Null
+    $script:WhisprStartedHere = $true
+    # Node takes a moment to listen; until then the status says "starting", not "not responding".
+    $script:WhisprStartingUntil = (Get-Date).AddSeconds(15)
+    return 'started'
+}
+
+# Stops the proxy and the claude.exe processes under it. Never raises. The PID comes from the
+# proxy itself when it answers; the pid file is only trusted when that process really is
+# the proxy's server.mjs, since a stale file can name a reused PID.
+function Stop-Whispr {
+    try {
+        $procId = (Get-WhisprStatus).Pid
+        if (-not $procId -and (Test-Path -LiteralPath $script:WhisprPidFile)) {
+            $fromFile = [int]((Get-Content -LiteralPath $script:WhisprPidFile -Raw).Trim())
+            $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$fromFile" -ErrorAction SilentlyContinue
+            if ($cim -and $cim.Name -eq 'node.exe' -and $cim.CommandLine -match 'server\.mjs') { $procId = $fromFile }
+        }
+        $script:WhisprStartedHere = $false
+        $script:WhisprStartingUntil = $null
+        if (-not $procId) { return $false }
+        & taskkill.exe /PID $procId /T /F | Out-Null
+        Remove-Item -LiteralPath $script:WhisprPidFile -ErrorAction SilentlyContinue
+        return $true
+    } catch {
+        Write-WhisprLog "Could not stop it: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# Claude Code on PATH, or else the copy the Claude desktop app keeps for itself under
+# %LOCALAPPDATA%\Claude*\claude-code\<version>\<hash>\claude.exe (newest first). $null if none.
+function Find-ClaudeCodeExe {
+    $cmd = Get-Command claude -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $found = @(Get-ChildItem -Path $env:LOCALAPPDATA -Directory -Filter 'Claude*' -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-ChildItem -Path (Join-Path $_.FullName 'claude-code\*\*\claude.exe') -ErrorAction SilentlyContinue } |
+        Sort-Object LastWriteTime -Descending)
+    if ($found.Count) { return $found[0].FullName }
+    return $null
+}
+
 # Opens a terminal where Claude Code uses this account's folder, so /login signs that account
 # in once. The sign-in itself happens in Claude Code and the browser: nothing here sees it.
 function Start-ClaudeCodeLogin {
     param([Parameter(Mandatory)][string]$Id, [string]$Name = $Id)
-    if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
+    $claudeExe = Find-ClaudeCodeExe
+    if (-not $claudeExe) {
         throw "The 'claude' command (Claude Code) was not found on PATH.`r`n`r`nYou can sign in from VS Code instead: switch to this account, then open the Claude panel there and sign in."
     }
     $cfg = Get-ProfileCodeConfig -Id $Id
@@ -886,17 +1044,20 @@ function Start-ClaudeCodeLogin {
         $setEnv = "`$env:CLAUDE_CONFIG_DIR = '$dirText'; "
     }
     $label = $Name -replace "'", "''"
-    $cmd = $setEnv + "Write-Host 'Signing in the Claude Code account for $label. When Claude starts, type /login and finish in the browser.'; claude"
+    $exeText = $claudeExe -replace "'", "''"
+    $cmd = $setEnv + "Write-Host 'Signing in the Claude Code account for $label. When Claude starts, type /login and finish in the browser.'; & '$exeText'"
     $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
     Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoExit', '-NoProfile', '-EncodedCommand', $enc)
 }
 
-# Opens or focuses the account's Claude window, then, with the sync on, points VS Code at the
-# same account. The note for the user is left in $script:CodeSyncNote.
+# Opens or focuses the account's Claude window, then, with the sync on, points VS Code (and
+# OpenWhispr, when it follows) at the same account. The note for the user is left in
+# $script:CodeSyncNote.
 function Start-ClaudeProfile {
     param([Parameter(Mandatory)][string]$Id, [switch]$NoCodeSync)
     $how = Open-ClaudeProfileWindow -Id $Id
     $script:CodeSyncNote = $(if ($NoCodeSync) { $null } else { Sync-VsCodeAccount -Id $Id })
+    if (-not $NoCodeSync) { Update-WhisprOnSwitch -Id $Id }
     return $how
 }
 
@@ -1600,6 +1761,8 @@ function Install-Switcher {
     if ($script:ScriptPath -ne $script:InstalledScript) {
         Copy-Item -LiteralPath $script:ScriptPath -Destination $script:InstalledScript -Force
         try { Unblock-File -LiteralPath $script:InstalledScript } catch { }
+        Install-WhisprProxy -From (Join-Path (Split-Path $script:ScriptPath -Parent) 'openwhispr') `
+            -To (Join-Path $script:SwitcherHome 'openwhispr') | Out-Null
     }
     New-SwitcherShortcut -Directory ([Environment]::GetFolderPath('Desktop'))
     New-SwitcherShortcut -Directory (Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs')
@@ -2582,7 +2745,8 @@ $statusLine           = New-Object System.Windows.Forms.Label
 $statusLine.Font      = $fontSmall
 $statusLine.ForeColor = $muted
 $statusLine.Location  = New-Object System.Drawing.Point(21, 398)
-$statusLine.Size      = New-Object System.Drawing.Size(500, 18)
+# Leaves room for the OpenWhispr box; AutoEllipsis shows the full text on hover.
+$statusLine.Size      = New-Object System.Drawing.Size(350, 18)
 $statusLine.AutoEllipsis = $true
 $statusLine.Anchor    = 'Left,Right,Bottom'
 $form.Controls.Add($statusLine)
@@ -2597,6 +2761,19 @@ $chkTray.Anchor    = 'Right,Bottom'
 $chkTray.Checked   = ((Get-Setting 'KeepInTray') -ne $false)
 $chkTray.Add_CheckedChanged({ Set-Setting 'KeepInTray' $chkTray.Checked })
 $form.Controls.Add($chkTray)
+
+# Same switch as the tray's "OpenWhispr router". Synced in code (Update-WhisprCheck), so
+# the handler only acts on a user's click, not on our own updates.
+$chkWhispr           = New-Object System.Windows.Forms.CheckBox
+$chkWhispr.Text      = 'OpenWhispr router'
+$chkWhispr.Font      = $fontSmall
+$chkWhispr.ForeColor = $muted
+$chkWhispr.Location  = New-Object System.Drawing.Point(384, 396)
+$chkWhispr.Size      = New-Object System.Drawing.Size(150, 22)
+$chkWhispr.Anchor    = 'Right,Bottom'
+$script:WhisprCheckSyncing = $false
+$chkWhispr.Add_CheckedChanged({ if (-not $script:WhisprCheckSyncing) { Switch-Whispr -On $chkWhispr.Checked } })
+$form.Controls.Add($chkWhispr)
 
 function New-Button {
     param([string]$Text, [int]$X, [int]$Width = 108, [switch]$Primary, [string]$Anchor = 'Left,Bottom')
@@ -2653,8 +2830,10 @@ function Update-List {
     if ($listView.SelectedItems.Count -gt 0) { $selectedId = $listView.SelectedItems[0].Tag.Id }
 
     $profiles = @(Get-ProfileList)
+    $whisprSummary = Get-WhisprSummary
+    $whisprId = $(if ($whisprSummary) { Get-WhisprAccountId -KnownIds @($profiles | ForEach-Object { $_.Id }) })
     # The timer calls this every few seconds. Rebuilding an unchanged list only flickers.
-    $sig = ($profiles | ForEach-Object { "$($_.Id)|$($_.Name)|$($_.Pid)|$($_.LastUsed)" }) -join ';'
+    $sig = (($profiles | ForEach-Object { "$($_.Id)|$($_.Name)|$($_.Pid)|$($_.LastUsed)" }) -join ';') + "|$whisprId|$whisprSummary"
     if (-not $Force -and $sig -eq $script:ListSignature) { return }
     $script:ListSignature = $sig
 
@@ -2683,6 +2862,7 @@ function Update-List {
                   elseif ($p.Id -eq $script:JustAdded -and $p.Name -eq $p.Id) { 'new - F2 to rename' }
                   elseif ($p.Name -ne $p.Id) { "folder: $($p.Id)" }
                   else { '' })
+        if ($whisprId -and $p.Id -eq $whisprId) { $note = $(if ($note) { "$note, OpenWhispr" } else { 'OpenWhispr' }) }
         $item.SubItems.Add($note) | Out-Null
         $item.SubItems[3].ForeColor = $muted
         $item.Tag = $p
@@ -2698,7 +2878,9 @@ function Update-List {
     $label = $(if ($script:ClaudeApp.Version -eq 'unknown') { $script:ClaudeApp.Kind } else { $script:ClaudeApp.Version })
     # Kept deliberately ASCII only: without a BOM, Windows PowerShell 5.1 reads this file
     # using the system codepage, so non-ASCII here renders as garbage on other locales.
-    $statusLine.Text = "$($profiles.Count) profile(s), $count running   |   Claude $label"
+    $statusLine.Text = "$($profiles.Count) profile(s), $count running   |   Claude $label" +
+        $(if ($whisprSummary) { "   |   $whisprSummary" })
+    Update-WhisprCheck
     Update-Buttons
 }
 
@@ -2801,6 +2983,73 @@ function Invoke-UseForVsCode {
     $p = Get-SelectedProfile
     if (-not $p) { return }
     $statusLine.Text = Sync-VsCodeAccount -Id $p.Id -Force
+}
+
+# "OpenWhispr: Work" for the status line and tray, from what the proxy itself reports.
+# Empty when the proxy files are missing, so nothing shows then.
+function Get-WhisprSummary {
+    if (-not (Get-WhisprPath)) { return '' }
+    if (-not (Test-WhisprOn)) { return 'OpenWhispr: off' }
+    $s = Get-WhisprStatus
+    if (-not $s.Running) {
+        if ($script:WhisprStartingUntil -and (Get-Date) -lt $script:WhisprStartingUntil) { return 'OpenWhispr: starting...' }
+        return 'OpenWhispr: not responding'
+    }
+    return "OpenWhispr: $($s.Label)" + $(if (-not $s.SignedIn) { ' (not signed in)' } elseif ($s.Organization) { " ($($s.Organization))" })
+}
+
+function Update-WhisprCheck {
+    $script:WhisprCheckSyncing = $true
+    try {
+        # Visible reads false while the window is hidden, so the answer is kept separately.
+        $has = [bool](Get-WhisprPath)
+        $chkWhispr.Visible = $has
+        $chkWhispr.Checked = ((Test-WhisprOn) -and $has)
+    } finally { $script:WhisprCheckSyncing = $false }
+}
+
+# The one on/off switch: on starts the proxy now and with every later start of the switcher;
+# off stops it now and keeps it off.
+function Switch-Whispr {
+    param([bool]$On = -not ((Test-WhisprOn) -and [bool](Get-WhisprPath)))
+    try {
+        if ($On) {
+            if (-not (Get-WhisprPath)) { throw $script:WhisprMissing }
+            Set-Setting 'OpenWhisprOn' $true
+            $who = Set-WhisprAccount -Id (Get-WhisprAccountId -KnownIds @(Get-ProfileList -SkipStatus | ForEach-Object { $_.Id }))
+            $how = Start-Whispr
+            $statusLine.Text = $(if ($how -eq 'started') { "OpenWhispr starting on '$who'..." } else { "OpenWhispr is on, using '$who'." })
+        } else {
+            Set-Setting 'OpenWhisprOn' $false
+            Stop-Whispr | Out-Null
+            $statusLine.Text = 'OpenWhispr stopped. It stays off until you switch it on again.'
+        }
+    } catch {
+        Write-WhisprLog $_.Exception.Message
+        Show-Message $_.Exception.Message 'OpenWhispr' 'OK' 'Error' | Out-Null
+    } finally {
+        if ($form.Visible) { Update-List -Force } else { Update-WhisprCheck }
+    }
+}
+
+function Switch-WhisprFollow {
+    $on = -not (Test-WhisprFollow)
+    Set-Setting 'OpenWhisprFollow' $on
+    $statusLine.Text = $(if ($on) { 'OpenWhispr will follow the account you launch or switch to.' } else { 'OpenWhispr stays on its account until you pick another.' })
+}
+
+function Invoke-UseForWhispr {
+    $p = Get-SelectedProfile
+    if (-not $p) { return }
+    try {
+        if (-not (Get-WhisprPath)) { throw $script:WhisprMissing }
+        $who = Set-WhisprAccount -Id $p.Id
+        $state = Get-ClaudeAccountInfo -StateFile (Get-ProfileCodeConfig -Id $p.Id).StateFile
+        $statusLine.Text = "OpenWhispr uses '$who'" + $(if ($state) { ": $($state.Email)." } else { ', but it is not signed in to Claude Code yet.' })
+        Update-List -Force
+    } catch {
+        Show-Message $_.Exception.Message 'OpenWhispr' 'OK' 'Error' | Out-Null
+    }
 }
 
 function Invoke-CodeLogin {
@@ -3071,13 +3320,24 @@ $null       = Add-MenuItem $menu 'Open folder'            { Invoke-OpenFolder }
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 $miCodeSync = Add-MenuItem $menu 'VS Code follows the account I switch to' { Switch-VsCodeSync }
 $null       = Add-MenuItem $menu 'Use for VS Code now'    { Invoke-UseForVsCode }
-$null       = Add-MenuItem $menu 'Sign in Claude Code for VS Code...' { Invoke-CodeLogin }
+$null       = Add-MenuItem $menu 'Sign in Claude Code for this account...' { Invoke-CodeLogin }
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+$miWhisprFollow = Add-MenuItem $menu 'OpenWhispr follows the account I switch to' { Switch-WhisprFollow }
+$miWhisprUse    = Add-MenuItem $menu 'Use for OpenWhispr now' { Invoke-UseForWhispr }
+$miWhisprSep    = New-Object System.Windows.Forms.ToolStripSeparator
+$menu.Items.Add($miWhisprSep) | Out-Null
 $miDelete   = Add-MenuItem $menu 'Delete'                 { Invoke-DeleteProfile } 'Del'
 $menu.Add_Opening({
     $p = Get-SelectedProfile
     if (-not $p) { $_.Cancel = $true; return }
     $miCodeSync.Checked = (Test-VsCodeSyncOn)
+    $hasWhispr = [bool](Get-WhisprPath)
+    $miWhisprFollow.Visible = $hasWhispr
+    $miWhisprUse.Visible = $hasWhispr
+    $miWhisprSep.Visible = $hasWhispr
+    $miWhisprFollow.Checked = (Test-WhisprFollow)
+    $signedIn = [bool](Get-ClaudeAccountInfo -StateFile (Get-ProfileCodeConfig -Id $p.Id).StateFile)
+    $miWhisprUse.Text = 'Use for OpenWhispr now' + $(if (-not $signedIn) { ' (not signed in)' })
     $miLaunch.Text    = $(if ($p.Pid) { 'Switch to' } else { 'Launch' })
     $miDelete.Enabled = -not $p.IsDefault
 })
@@ -3133,6 +3393,8 @@ function Show-Switcher {
 }
 
 function Exit-Switcher {
+    # Only a proxy this switcher started: one started some other way is left alone.
+    if ($script:WhisprStartedHere) { Stop-Whispr | Out-Null }
     $script:ExitRequested = $true
     $notify.Visible = $false
     [System.Windows.Forms.Application]::Exit()
@@ -3162,6 +3424,15 @@ $trayMenu.Add_Opening({
     $route.Checked = (Test-SignInRoutingOn)
     $codeSync = Add-MenuItem $trayMenu 'VS Code follows the account I switch to' { Switch-VsCodeSync }
     $codeSync.Checked = (Test-VsCodeSyncOn)
+    if (Get-WhisprPath) {
+        $whOn = Add-MenuItem $trayMenu 'OpenWhispr router' { Switch-Whispr }
+        $whOn.Checked = (Test-WhisprOn)
+        $whFollow = Add-MenuItem $trayMenu 'OpenWhispr follows the account I switch to' { Switch-WhisprFollow }
+        $whFollow.Checked = (Test-WhisprFollow)
+        $whInfo = New-Object System.Windows.Forms.ToolStripMenuItem((Get-WhisprSummary))
+        $whInfo.Enabled = $false
+        $trayMenu.Items.Add($whInfo) | Out-Null
+    }
     $trayMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
     $null = Add-MenuItem $trayMenu 'Exit' { Exit-Switcher }
     $_.Cancel = $false
@@ -3236,6 +3507,17 @@ if (-not (Test-SignInRoutingOn) -and (Test-Path -LiteralPath (Get-RouterRegistry
 }
 
 $script:ExitRequested = $false
+$script:WhisprStartedHere = $false
+# Tell the OpenWhispr proxy its account (the file may be missing), then start it if it is switched on.
+# A problem is logged and shown in the status line, never allowed to stop the switcher.
+if (Get-WhisprPath) {
+    try {
+        Set-WhisprAccount -Id (Get-WhisprAccountId -KnownIds @(Get-ProfileList -SkipStatus | ForEach-Object { $_.Id })) | Out-Null
+        if (Test-WhisprOn) { Start-Whispr | Out-Null }
+    } catch {
+        Write-WhisprLog "Could not start: $($_.Exception.Message)"
+    }
+}
 $notify.Visible = $true
 Update-List -Force
 if (-not $Tray) { Show-Switcher }

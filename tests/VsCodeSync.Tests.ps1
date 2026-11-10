@@ -167,6 +167,8 @@ function Set-VsCodeClaudeConfigDir { param([string]$ConfigDir) $script:Applied.A
 function Resolve-ClaudeProfile { param($Name, [switch]$SkipStatus) return [pscustomobject]@{ Id = $Name; Name = "Label $Name" } }
 $script:Opened = New-Object System.Collections.Generic.List[string]
 function Open-ClaudeProfileWindow { param($Id) $script:Opened.Add($Id); return 'started' }
+$script:Followed = New-Object System.Collections.Generic.List[string]
+function Update-WhisprOnSwitch { param($Id) $script:Followed.Add($Id) }
 
 $script:Settings = @{}
 Assert ($null -eq (Sync-VsCodeAccount -Id 'Work') -and $script:Applied.Count -eq 0) 'Sync off must not touch VS Code'
@@ -201,5 +203,6 @@ Assert ($script:CodeSyncNote -match 'Label Work') 'Launch left no note'
 $script:Applied.Clear()
 Start-ClaudeProfile -Id 'Work' -NoCodeSync | Out-Null
 Assert ($script:Applied.Count -eq 0 -and $null -eq $script:CodeSyncNote) '-NoCodeSync still synced'
+Assert ($script:Followed.Count -eq 1 -and $script:Followed[0] -eq 'Work') 'A switch must tell ClaudeWhispr once, and -NoCodeSync must not'
 
 'VsCodeSync tests passed'

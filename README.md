@@ -153,6 +153,13 @@ from the tray first. On the Store build, `Default` opened from the switcher star
 through the shell and does not get them. Names must be letters, digits and `_`, not
 starting with a digit; others are skipped.
 
+One variable is always set: `CLAUDE_CONFIG_DIR`, to the account's Claude Code folder
+(`~\.claude-<id>`, or `ConfigDir` under `ProfileCode`), and removed for `Default`, which uses
+`~\.claude`. The desktop app's Code tab then keeps each account's chats, memory and
+"signed in as" record in that account's folder. Without it every account's Code tab wrote
+into `~\.claude`, mixing the chat history, and VS Code and OpenWhispr showed the last
+account to run there as Default's. A `CLAUDE_CONFIG_DIR` in `ProfileEnv` still wins.
+
 Extra command line flags for one account work the same way, under `ProfileArgs`, as one
 string or as a list:
 
@@ -184,10 +191,11 @@ right-click menu or the tray, or run `-VsCodeSync on`. Then:
    its own folder, `~\.claude-<folder name>`. Override one with
    `"ProfileCode": { "Work": { "ConfigDir": "C:\\Users\\you\\.claude-work" } }` in
    `settings.json` (a full path: the extension does not expand `~`).
-2. Sign each account in once. Right-click it and choose **Sign in Claude Code for VS Code...**
+2. Sign each account in once. Right-click it and choose **Sign in Claude Code for this account...**
    (or `-CodeLogin Work`). A terminal opens with that account's folder selected: type `/login`
-   and finish in the browser. This needs the `claude` command on PATH; without it, switch to the
-   account and sign in from the Claude panel in VS Code instead. The switcher never sees your
+   and finish in the browser. This uses the `claude` command on PATH, or else the copy of Claude
+   Code that the Claude desktop app keeps for itself; without either, switch to the account and
+   sign in from the Claude panel in VS Code instead. The switcher never sees your
    password or tokens, and never copies them.
 3. From then on, launching an account in the switcher moves VS Code to it. `-VsCode Work`
    does the same by hand, and `-Status` shows each folder and who is signed in there.
@@ -197,6 +205,49 @@ right-click menu or the tray, or run `-VsCodeSync on`. Then:
 > chat to use the new one. Only the extension follows; the `claude` command in a terminal is
 > not touched. If your organization sets `forceLoginOrgUUID` in managed settings, signing in to
 > another organization can be refused.
+
+### OpenWhispr cleanup with Claude Haiku
+
+[OpenWhispr](https://github.com/OpenWhispr/openwhispr) is a dictation app. Its *Dictation
+Cleanup* can call any OpenAI-compatible server. The switcher ships a small one, in the
+`openwhispr` folder: a proxy on `127.0.0.1:8787` that answers each cleanup with Claude Haiku
+through Claude Code, signed in as one of your accounts. No API key is needed. It needs
+[Node.js](https://nodejs.org) 22 or newer on PATH; nothing else is installed.
+
+In OpenWhispr, open **Settings > Language Models > Dictation Cleanup > Self-Hosted** and fill in:
+
+| Field | Value |
+| --- | --- |
+| URL | `http://127.0.0.1:8787/v1` (or `http://localhost:8787/v1`) |
+| Model | `haiku` |
+| API key | anything, for example `local` |
+
+In the switcher:
+
+- **OpenWhispr router** (tray, and the box at the bottom of the window, on by default) starts the
+  proxy now and with every later start of the switcher; unticked, it is stopped and stays off.
+  On **Exit**, a proxy the switcher started is stopped with it.
+- **OpenWhispr follows the account I switch to** (right-click menu and tray, on by default):
+  launching or switching to an account moves the proxy to that account's Claude Code folder,
+  the same folder the VS Code sync uses. **Use for OpenWhispr now** moves it by hand.
+- The status line and the tray show the account the proxy reports it is using, and the list
+  marks that account. An account whose Claude Code folder is not signed in shows
+  "(not signed in)": sign it in as in step 2 above. When a cleanup fails, OpenWhispr pastes
+  the raw text.
+
+Each cleanup runs in a fresh `claude -p` that keeps no transcript or prompt history and sends
+no optional telemetry, so it does not show up in your Claude chats or Claude Code sessions. It
+still counts against that account's usage, and the text goes to Anthropic under that
+account's terms. The proxy warns in its log if your organization's managed settings would log
+prompt content. Signing in with a subscription is meant for your own use; do not offer the
+proxy to other people.
+
+`-Install` copies the proxy to `%LOCALAPPDATA%\ClaudeProfiles\.switcher\openwhispr`. Its log,
+`account.json` (the account's `CLAUDE_CONFIG_DIR`, `null` for `~\.claude`, picked up without a
+restart) and the last cleanup prompt (to start warm) are in
+`%LOCALAPPDATA%\ClaudeProfiles\.openwhispr`. The log holds timings and sizes, never the text.
+Settings: `OpenWhisprOn`, `OpenWhisprFollow`, `OpenWhisprAccount`, and `OpenWhisprProxyPath` to
+run the proxy from another folder.
 
 ## Command line
 
